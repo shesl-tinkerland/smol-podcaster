@@ -35,8 +35,7 @@ frozenlist==1.4.0
 fsspec==2023.9.2
 h11==0.14.0
 honcho==1.1.0
-httpcore==0.18.0
-httpx==0.25.0
+httpx>=0.27.0
 huggingface-hub==0.17.3
 idna==3.4
 importlib-metadata==6.11.0
@@ -91,6 +90,11 @@ vine==5.1.0
 wcwidth==0.2.13
 websockets==12.0
 Werkzeug==3.0.1
-yarl==1.9.2
+ yarl==1.9.2
 zipp==3.17.0
 gunicorn>=20.1.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+pytest>=8.0.0
+httpx>=0.27.0
