@@ -25,16 +25,41 @@ Make a copy of the `.env.sample` and replace it with your keys:
 
 ### Run with web UI + background runs
 
-If you want to run a bunch in parallel (or remotely) you can use the web UI + celery. Before running, you'll need a broker for celery ([I use RabbitMQ](https://docs.celeryq.dev/en/stable/getting-started/backends-and-brokers/rabbitmq.html)).
+The app now uses a FastAPI backend and a Next.js frontend, with Celery for background processing. You will need a Celery broker ([RabbitMQ](https://docs.celeryq.dev/en/stable/getting-started/backends-and-brokers/rabbitmq.html)) reachable at the URL in `celeryconfig.py`.
 
-If you have honcho installed, simply run `honcho start`, otherwise run each command manually:
+- Option A: start backend API + worker via Procfile (honcho)
 
 ```
-celery -A tasks worker --loglevel=INFO
-flask --app web.py --debug run
+cd smol-podcaster
+honcho start
 ```
 
-Then simply go to `localhost:5000` and fill out the form. The files will be saved locally as `/podcast-results` just like the cli version.
+This starts:
+- API: `uvicorn api.main:app` on `${PORT:-8000}`
+- Worker: `celery -A tasks worker ...`
+
+- Option B: start them manually
+
+```
+# Terminal 1 – Celery worker
+cd smol-podcaster
+celery -A tasks worker --loglevel=INFO -E -n smol_podcaster@%h
+
+# Terminal 2 – FastAPI
+cd smol-podcaster
+uvicorn api.main:app --host 0.0.0.0 --port 8000
+```
+
+Frontend (Next.js):
+
+```
+cd frontend
+npm install
+export NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+npm run dev
+```
+
+Open http://localhost:3000 and use the UI. Generated files are saved under `./podcasts-results` and `./podcasts-clean-transcripts`.
 
 ### Run from CLI
 
@@ -89,6 +114,39 @@ Each run generates a set of show notes from both OAI and Claude. The easiest way
 ![Screenshot](screenshots/edit-full.png)
 
 After you're done editing, press "Save Changes" and it will rewrite the Markdown in your file to show the new cleaned and merged list.
+
+# API quick start
+
+Basic endpoints (served by FastAPI):
+
+- `POST /process` (multipart): fields `file_input` (file) or `url` (string), `speakers` (int), `name` (str), optional `transcript_only` (bool), `generate_extra` (bool). Returns `{ task_id }`.
+- `POST /sync_chapters` (json): `{ video_name, audio_name, chapters }`. Returns `{ task_id }`.
+- `GET /episodes`: lists available episodes.
+- `GET /episodes/{name}/show_notes` and `PUT /episodes/{name}/show_notes` to fetch/update show notes.
+- `GET /tasks/{task_id}`: Celery task status/result.
+
+Example (curl):
+
+```
+curl -F url=https://example.com/audio.mp3 \
+     -F speakers=2 \
+     -F name=episode1 \
+     http://localhost:8000/process
+```
+
+### Testing
+
+Backend tests live under `smol-podcaster/tests`.
+
+```
+cd smol-podcaster
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+Note: for full production dependencies (`requirements.txt`) prefer Python 3.11/3.12 to avoid heavy wheel builds on some platforms.
 
 # License
 

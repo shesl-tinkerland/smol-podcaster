@@ -1,22 +1,15 @@
 import argparse
 import requests
 import logging
-import Levenshtein
 import tempfile
 
 from dotenv import load_dotenv
 import os
 import re
 import json
-
-import replicate
-from openai import OpenAI
-from anthropic import Anthropic
+from difflib import SequenceMatcher
 
 load_dotenv()
-
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-anthropic = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL") or "claude-3-5-sonnet-20240620"
 GPT_MODEL = os.environ.get("GPT_MODEL") or "gpt-4o-2024-08-06"
@@ -31,6 +24,7 @@ fix_recording_mapping = {
 
 def call_anthropic(prompt, temperature=0.5):   
     try:
+        from anthropic import Anthropic
         anthropic = Anthropic(
             api_key=os.environ.get("ANTHROPIC_API_KEY"),
         )
@@ -50,13 +44,15 @@ def call_anthropic(prompt, temperature=0.5):
 
 def call_openai(prompt, temperature=0.5):
     try:
+        from openai import OpenAI
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
         result = client.chat.completions.create(model=GPT_MODEL,
         temperature=temperature,
         messages=[
             {"role": "user", "content": prompt}
         ])
         return result.choices[0].message.content
-    except OpenAI.BadRequestError as e:
+    except Exception as e:
         error_msg = f"An error occurred with OpenAI: {e}"
         print(error_msg)
         return error_msg
@@ -67,6 +63,8 @@ def transcribe_audio(file_url, episode_name, speakers_count):
 
     print(f"Running smol-podcaster on {file_url}")
 
+    # Lazy import to avoid heavy deps at import time
+    import replicate
     output = replicate.run(
         "thomasmol/whisper-diarization:7e5dafea13d80265ea436e51a310ae5103b9f16e2039f54de4eede3060a61617",
         input={
@@ -260,6 +258,7 @@ def update_video_chapters(audio_chapters, audio_file_name, video_file_name):
 
         timestamp, topic = chapter.split("]", 1)
         timestamp = timestamp.strip("[]").strip()
+        topic = topic.strip()
 
         # Find the corresponding segment in the audio transcript
         # We go over every individual timestamps
@@ -270,14 +269,40 @@ def update_video_chapters(audio_chapters, audio_file_name, video_file_name):
                 break
 
         if audio_segment is not None:
-            # Find the closest matching segment in the video transcript
+            # Find the closest matching segment in the video transcript using a combination
+            # of textual similarity and timestamp proximity if available.
             closest_segment = None
-            min_distance = float("inf")
+            best_score = float("inf")
+
+            # Parse audio timestamp seconds
+            def parse_seconds(line: str) -> int:
+                try:
+                    ts = line.split("]")[0].split("[")[-1].strip()
+                    h, m, s = [int(x) for x in ts.split(":")]
+                    return h * 3600 + m * 60 + s
+                except Exception:
+                    return -1
+
+            audio_seconds = parse_seconds(audio_segment)
+
             for segment in video_transcript.split("\n"):
-                distance = Levenshtein.distance(segment, audio_segment)
-                
-                if distance < min_distance:
-                    min_distance = distance
+                # Textual distance
+                try:
+                    import Levenshtein as _Lev
+                    text_distance = _Lev.distance(segment, audio_segment)
+                except Exception:
+                    ratio = SequenceMatcher(None, segment, audio_segment).ratio()
+                    text_distance = int((1 - ratio) * max(len(segment), len(audio_segment)))
+
+                # Timestamp distance (if both have timestamps)
+                video_seconds = parse_seconds(segment)
+                time_distance = abs(video_seconds - audio_seconds) if (audio_seconds >= 0 and video_seconds >= 0) else 0
+
+                # Weighted score: prioritize time proximity heavily
+                score = time_distance * 1000 + text_distance
+
+                if score < best_score:
+                    best_score = score
                     closest_segment = segment
 
             if closest_segment is not None:
