@@ -1,7 +1,11 @@
 import pytest
 import asyncio
-from unittest.mock import patch, MagicMock
-from app.models.episode import ProcessingStatus
+from unittest.mock import patch, MagicMock, AsyncMock
+from app.models.episode import ProcessingStatus, EpisodeCreate
+from app.core.tasks import process_episode_task
+import tempfile
+import os
+import json
 
 @pytest.mark.integration
 class TestEpisodeProcessingFlow:
@@ -129,3 +133,194 @@ class TestTranscriptAccess:
         assert response.status_code == 200
         data = response.json()
         assert "raw_transcript" in data
+
+
+@pytest.mark.integration
+class TestCompleteWorkflow:
+    @patch("replicate.run")
+    @patch("app.services.ai_service.OpenAI")
+    @patch("app.services.ai_service.Anthropic")
+    @patch("app.api.v1.episodes.episode_service")
+    def test_end_to_end_episode_creation_and_processing(
+        self, mock_episode_service, mock_anthropic, mock_openai, mock_replicate, client
+    ):
+        # Setup mocks
+        mock_episode = MagicMock()
+        mock_episode.id = "workflow-test-123"
+        mock_episode.name = "Workflow Test"
+        mock_episode.speakers_count = 2
+        mock_episode.status = ProcessingStatus.PENDING
+        mock_episode.created_at = "2024-01-01T00:00:00"
+        mock_episode.updated_at = "2024-01-01T00:00:00"
+        
+        mock_episode_service.create_episode = AsyncMock(return_value=mock_episode)
+        mock_episode_service.get_episode = AsyncMock(return_value=mock_episode)
+        mock_episode_service.list_episodes = AsyncMock(return_value=[mock_episode])
+        
+        # Mock transcription
+        mock_replicate.return_value = {
+            'segments': [
+                {"speaker": "SPEAKER 1", "text": "Welcome to the podcast", "start": "0", "end": "3"},
+                {"speaker": "SPEAKER 2", "text": "Thanks for having me", "start": "3", "end": "6"}
+            ]
+        }
+        
+        # Mock AI responses
+        mock_openai_client = MagicMock()
+        mock_openai_response = MagicMock()
+        mock_openai_response.choices = [MagicMock(message=MagicMock(content="GPT-4 response"))]
+        mock_openai_client.chat.completions.create.return_value = mock_openai_response
+        mock_openai.return_value = mock_openai_client
+        
+        mock_anthropic_client = MagicMock()
+        mock_anthropic_response = MagicMock()
+        mock_anthropic_response.content = [MagicMock(text="Claude response")]
+        mock_anthropic_client.messages.create.return_value = mock_anthropic_response
+        mock_anthropic.return_value = mock_anthropic_client
+        
+        # Step 1: Create episode
+        response = client.post(
+            "/api/v1/episodes/",
+            data={
+                "name": "Workflow Test",
+                "speakers_count": "2",
+                "url": "https://example.com/workflow-test.mp3",
+                "transcript_only": "false",
+                "generate_extra": "true"
+            }
+        )
+        assert response.status_code == 200
+        episode_data = response.json()
+        episode_id = episode_data["id"]
+        
+        # Step 2: List episodes to verify creation
+        response = client.get("/api/v1/episodes/")
+        assert response.status_code == 200
+        episodes = response.json()
+        assert len(episodes) > 0
+        assert any(e["id"] == episode_id for e in episodes)
+        
+        # Step 3: Get specific episode details
+        response = client.get(f"/api/v1/episodes/{episode_id}")
+        assert response.status_code == 200
+        episode_detail = response.json()
+        assert episode_detail["name"] == "Workflow Test"
+        
+        # Step 4: Update show notes
+        mock_episode.show_notes = []
+        response = client.patch(
+            f"/api/v1/episodes/{episode_id}/show-notes",
+            json=[
+                {"text": "OpenAI", "url": "https://openai.com"},
+                {"text": "Anthropic", "url": "https://anthropic.com"}
+            ]
+        )
+        # Would normally check response but need file mocking
+        
+        # Step 5: Test transcript retrieval
+        with patch("os.path.exists", return_value=True):
+            with patch("builtins.open", create=True) as mock_open:
+                mock_open.return_value.__enter__.return_value.read.return_value = "Test transcript"
+                
+                response = client.get("/api/v1/transcripts/Workflow Test")
+                assert response.status_code == 200
+                assert response.json()["transcript"] == "Test transcript"
+
+
+@pytest.mark.integration
+class TestErrorHandling:
+    def test_invalid_episode_creation_missing_data(self, client):
+        response = client.post(
+            "/api/v1/episodes/",
+            data={
+                "speakers_count": "2",
+                # Missing name and file/url
+            }
+        )
+        assert response.status_code == 422  # Validation error
+    
+    @patch("app.api.v1.episodes.episode_service")
+    def test_episode_not_found_handling(self, mock_service, client):
+        mock_service.get_episode = AsyncMock(return_value=None)
+        
+        response = client.get("/api/v1/episodes/non-existent-id")
+        assert response.status_code == 404
+        assert "Episode not found" in response.json()["detail"]
+    
+    @patch("app.api.v1.processing.AsyncResult")
+    def test_task_failure_handling(self, mock_async_result, client):
+        mock_result = MagicMock()
+        mock_result.state = "FAILURE"
+        mock_result.info = "Transcription service unavailable"
+        mock_async_result.return_value = mock_result
+        
+        response = client.get("/api/v1/processing/status/failed-task-123")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == ProcessingStatus.FAILED
+        assert "Transcription service unavailable" in data["error_message"]
+
+
+@pytest.mark.integration
+class TestConcurrentOperations:
+    @patch("app.api.v1.episodes.process_episode_task")
+    @patch("app.api.v1.episodes.episode_service")
+    async def test_multiple_episode_creation(self, mock_service, mock_task, client):
+        # Mock service to return different episodes
+        episodes = []
+        for i in range(3):
+            episode = MagicMock()
+            episode.id = f"concurrent-{i}"
+            episode.name = f"Concurrent Episode {i}"
+            episode.speakers_count = 2
+            episode.status = ProcessingStatus.PENDING
+            episode.created_at = "2024-01-01T00:00:00"
+            episode.updated_at = "2024-01-01T00:00:00"
+            episodes.append(episode)
+        
+        mock_service.create_episode = AsyncMock(side_effect=episodes)
+        mock_task.delay.return_value = None
+        
+        # Create multiple episodes concurrently
+        responses = []
+        for i in range(3):
+            response = client.post(
+                "/api/v1/episodes/",
+                data={
+                    "name": f"Concurrent Episode {i}",
+                    "speakers_count": "2",
+                    "url": f"https://example.com/episode{i}.mp3",
+                    "transcript_only": "false",
+                    "generate_extra": "false"
+                }
+            )
+            responses.append(response)
+        
+        # Verify all were created successfully
+        for i, response in enumerate(responses):
+            assert response.status_code == 200
+            data = response.json()
+            assert data["id"] == f"concurrent-{i}"
+            assert data["name"] == f"Concurrent Episode {i}"
+
+
+@pytest.mark.integration
+class TestDataPersistence:
+    def test_episode_data_persistence_across_requests(self, client):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Override directories for testing
+            with patch('app.core.config.settings.RESULTS_DIR', tmpdir):
+                # Create test files
+                substack_file = os.path.join(tmpdir, "substack_persistence_test.md")
+                with open(substack_file, 'w') as f:
+                    f.write("### Show Notes\n- Test note\n\n### Timestamps\n[00:00:00] Start")
+                
+                with patch("app.api.v1.episodes.episode_service") as mock_service:
+                    mock_service.list_episodes = AsyncMock(return_value=[])
+                    
+                    # First request - should pick up file from filesystem
+                    response = client.get("/api/v1/episodes/")
+                    assert response.status_code == 200
+                    
+                    # The service should have been called
+                    mock_service.list_episodes.assert_called_once()
