@@ -18,8 +18,8 @@ load_dotenv()
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 anthropic = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL") or "claude-3-5-sonnet-20240620"
-GPT_MODEL = os.environ.get("GPT_MODEL") or "gpt-4o-2024-08-06"
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL") or "claude-haiku-4-5-20251001"
+GPT_MODEL = os.environ.get("GPT_MODEL") or "gpt-5-mini"
 
 # common ML words that the replicate model doesn't know, can programatically update the transcript
 fix_recording_mapping = {
